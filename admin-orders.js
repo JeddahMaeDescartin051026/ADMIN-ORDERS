@@ -1,10 +1,10 @@
-import { initializeApp, getApps, getApp } from "firebase/app";
+import { initializeApp, getApps, getApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
 import {
   getAuth,
   onAuthStateChanged,
   signInWithEmailAndPassword,
   signOut,
-} from "firebase/auth";
+} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
 import {
   getFirestore,
   collection,
@@ -17,7 +17,7 @@ import {
   updateDoc,
   deleteDoc,
   Timestamp,
-} from "firebase/firestore";
+} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
 
 /* ---------- Setup ---------- */
