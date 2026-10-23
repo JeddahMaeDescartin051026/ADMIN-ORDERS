@@ -16,11 +16,18 @@ import {
   doc,
   updateDoc,
   deleteDoc,
+  getDoc,
+  setDoc,
+  serverTimestamp,
   Timestamp,
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
 
 /* ---------- Setup ---------- */
+const ORDER_PREFIX = "051026-";
+// "051026-3", built from the order's number (older orders have none)
+const orderLabel = (o) =>
+  o.orderSeq != null ? ORDER_PREFIX + o.orderSeq : o.orderNo || "";
 const ADMIN_EMAIL = "chanchan.tumulak@gmail.com";
 const TZ = "Asia/Manila"; // Philippine time, UTC+8 (no daylight saving)
 const MAX_ORDERS = 500;
@@ -46,6 +53,7 @@ const el = {
   toDate: $("toDate"),
   statusFilter: $("statusFilter"),
   searchBox: $("searchBox"),
+  itemBox: $("itemBox"),
   applyBtn: $("applyBtn"),
   chips: $("chips"),
   sumCount: $("sumCount"),
@@ -57,6 +65,8 @@ const el = {
 };
 
 let allOrders = []; // orders returned by the last Firestore query
+let soldMap = new Map(); // soldItems document id -> { orderId, orderNo, name }
+const picks = new Map(); // order id -> Set of ticked item keys (kept while you filter or search)
 
 /* ---------- Helpers ---------- */
 const esc = (v) =>
@@ -66,6 +76,15 @@ const esc = (v) =>
 
 const peso = (n) =>
   "₱" + Number(n || 0).toLocaleString("en-PH", { maximumFractionDigits: 2 });
+
+// Identifies "the same item" across orders: product id if the order saved one, else the name
+const itemKey = (it) =>
+  it && typeof it === "object"
+    ? String(it.id ?? it.productId ?? it.name ?? it.title ?? "").trim().toLowerCase()
+    : String(it ?? "").trim().toLowerCase();
+
+// Document id for a sold item. Keep identical to soldDocId in order-status.js
+const soldDocId = (key) => "i_" + encodeURIComponent(key).slice(0, 400);
 
 // "YYYY-MM-DD" for a Date, as seen in Philippine time
 const manilaYMD = (d = new Date()) =>
@@ -201,6 +220,7 @@ el.chips.addEventListener("click", (e) => {
 el.applyBtn.addEventListener("click", loadOrders);
 el.statusFilter.addEventListener("change", render);
 el.searchBox.addEventListener("input", render);
+el.itemBox.addEventListener("input", render);
 
 /* ---------- Load from Firestore ---------- */
 async function loadOrders() {
@@ -221,6 +241,7 @@ async function loadOrders() {
 
     const snap = await getDocs(query(collection(db, "orders"), ...constraints));
     allOrders = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    await loadSoldItems();
     showMessage("");
     render();
   } catch (err) {
@@ -249,16 +270,56 @@ async function loadOrders() {
 function visibleOrders() {
   const status = el.statusFilter.value;
   const q = el.searchBox.value.trim().toLowerCase();
+  const itemQ = el.itemBox.value.trim().toLowerCase();
 
   return allOrders.filter((o) => {
     if (status && o.status !== status) return false;
+    if (itemQ) {
+      const items = Array.isArray(o.items) ? o.items : [];
+      const hasItem = items.some((it) =>
+        String(it && typeof it === "object" ? it.name || it.title || "" : it)
+          .toLowerCase()
+          .includes(itemQ)
+      );
+      if (!hasItem) return false;
+    }
     if (!q) return true;
-    return [o.name, o.email, o.phone, o.social, o.id]
+    return [orderLabel(o), o.name, o.email, o.phone, o.social, o.id]
       .some((v) => String(v || "").toLowerCase().includes(q));
   });
 }
 
-function itemLine(it) {
+// Reads every sold-item record, so each order's breakdown can show a SOLD tag
+async function loadSoldItems() {
+  try {
+    const snap = await getDocs(collection(db, "soldItems"));
+    soldMap = new Map(snap.docs.map((d) => [d.id, d.data()]));
+  } catch (err) {
+    console.error(err);
+    soldMap = new Map();
+    toast("Couldn't load the sold items, so SOLD tags may be missing.");
+  }
+}
+
+// "other" = sold through a different order, "mine" = sold through this order
+function soldState(it, order) {
+  const rec = soldMap.get(soldDocId(itemKey(it)));
+  if (!rec) return null;
+  return rec.orderId === order.id ? { kind: "mine", rec } : { kind: "other", rec };
+}
+
+// Is this item ticked? Items sold in another order are never ticked.
+function isPicked(order, key, sold) {
+  if (sold && sold.kind === "other") return false;
+  const chosen = picks.get(order.id);
+  if (chosen) return chosen.has(key);
+  if (order.status === "COMPLETED" && Array.isArray(order.completedKeys)) {
+    return order.completedKeys.includes(key);
+  }
+  return true; // new orders start with every available item ticked
+}
+
+function itemLine(it, order) {
   if (it === null || typeof it !== "object") {
     return `<li><span>${esc(it)}</span></li>`;
   }
@@ -266,25 +327,37 @@ function itemLine(it) {
   const qty = it.qty ?? it.quantity ?? 1;
   const price = Number(it.price);
   const extras = [it.size, it.color, it.condition].filter(Boolean).join(", ");
+  const sold = soldState(it, order);
+  const key = itemKey(it);
+  const locked =
+    order.status === "COMPLETED" || order.status === "ITEM SOLD" || (sold && sold.kind === "other");
+  const tick = `<input type="checkbox" class="pick" data-key="${esc(key)}" ${isPicked(order, key, sold) ? "checked" : ""} ${locked ? "disabled" : ""} aria-label="Customer still wants ${esc(name)}" />`;
+  const tag = !sold
+    ? ""
+    : sold.kind === "other"
+      ? `<span class="tag tag-sold" title="Sold in order ${esc(sold.rec.orderNo || "")}">SOLD${sold.rec.orderNo ? ` · ${esc(sold.rec.orderNo)}` : ""}</span>`
+      : `<span class="tag tag-mine">SOLD · THIS ORDER</span>`;
   return `
-    <li>
-      <span>${esc(name)}${qty > 1 ? ` × ${esc(qty)}` : ""}
-        ${extras ? `<span class="meta"> (${esc(extras)})</span>` : ""}</span>
-      <span>${Number.isFinite(price) ? peso(price * qty) : ""}</span>
+    <li class="${sold && sold.kind === "other" ? "is-sold" : ""}">
+      <label class="pick-label">${tick}<span class="pname">${esc(name)}${qty > 1 ? ` × ${esc(qty)}` : ""}
+        ${extras ? `<span class="meta"> (${esc(extras)})</span>` : ""}</span></label>
+      <span class="side">${tag}<span>${Number.isFinite(price) ? peso(price * qty) : ""}</span></span>
     </li>`;
 }
 
 function orderHTML(o) {
-  const done = o.status === "COMPLETED";
+  const st = o.status === "COMPLETED" ? "done" : o.status === "ITEM SOLD" ? "sold" : "pending";
+  const label = { done: "Completed", sold: "Item sold", pending: "Not completed" }[st];
+  const btnText = { done: "Mark as not completed", sold: "Reopen order", pending: "Mark as completed" }[st];
   const items = Array.isArray(o.items) ? o.items : [];
 
   return `
   <details class="order" data-id="${esc(o.id)}">
     <summary>
-      <span class="o-name">${esc(o.name || "No name")}</span>
+      <span class="o-name"><span class="o-no">${esc(orderLabel(o) || "No number")}</span>${esc(o.name || "No name")}</span>
       <span class="o-total">${peso(o.total)}</span>
       <span class="o-date">${esc(formatWhen(o.createdAt))}</span>
-      <span class="pill ${done ? "pill-done" : "pill-pending"}">${done ? "Completed" : "Not completed"}</span>
+      <span class="pill pill-${st}">${label}</span>
     </summary>
     <div class="order-body">
       <div class="kv">
@@ -297,15 +370,15 @@ function orderHTML(o) {
       </div>
       <div>
         <h2>Items (${items.length})</h2>
-        <ul class="items">${items.map(itemLine).join("") || "<li>No items</li>"}</ul>
+        <ul class="items">${items.map((it) => itemLine(it, o)).join("") || "<li>No items</li>"}</ul>
       </div>
       <div class="full actions">
         <button type="button" class="btn btn-primary btn-small" data-action="toggle">
-          ${done ? "Mark as not completed" : "Mark as completed"}
+          ${btnText}
         </button>
         <button type="button" class="btn btn-danger btn-small" data-action="delete">Delete</button>
       </div>
-      <p class="full order-id">Order ID: ${esc(o.id)}</p>
+      <p class="full order-id">Order number: ${esc(orderLabel(o) || "none (older order)")} &middot; ID: ${esc(o.id)}</p>
     </div>
   </details>`;
 }
@@ -317,7 +390,7 @@ function render() {
 
   el.sumCount.textContent = list.length;
   el.sumTotal.textContent = peso(list.reduce((s, o) => s + (Number(o.total) || 0), 0));
-  el.sumPending.textContent = list.filter((o) => o.status !== "COMPLETED").length;
+  el.sumPending.textContent = list.filter((o) => o.status !== "COMPLETED" && o.status !== "ITEM SOLD").length;
 
   if (!list.length && el.listMsg.hidden) {
     showMessage(
@@ -334,7 +407,63 @@ function render() {
   }
 }
 
+/* ---------- Items sold: one record per item, so other buyers see "SOLD" ---------- */
+const orderItems = (order) => (Array.isArray(order.items) ? order.items : []);
+const uniqueKeys = (order) => [...new Set(orderItems(order).map(itemKey).filter(Boolean))];
+
+// Completed order -> only its ticked items are sold (unless another order already got them)
+async function markItemsSold(order, keys) {
+  try {
+    const already = [];
+    for (const k of keys) {
+      const ref = doc(db, "soldItems", soldDocId(k));
+      const snap = await getDoc(ref);
+      if (snap.exists() && snap.data().orderId !== order.id) {
+        already.push(snap.data().name || k);
+        continue;
+      }
+      const it = orderItems(order).find((i) => itemKey(i) === k);
+      await setDoc(ref, {
+        orderId: order.id,
+        orderNo: orderLabel(order),
+        name: (it && (it.name || it.title)) || k,
+        soldAt: serverTimestamp(),
+      });
+    }
+    if (already.length) {
+      toast(`Heads up: ${already.join(", ")} was already sold in another order.`);
+    }
+  } catch (err) {
+    console.error(err);
+    toast("Order completed, but couldn't mark its items as sold.");
+  }
+}
+
+// Reopened order -> give back only the items that were sold through this order
+async function releaseItems(order) {
+  try {
+    for (const k of uniqueKeys(order)) {
+      const ref = doc(db, "soldItems", soldDocId(k));
+      const snap = await getDoc(ref);
+      if (snap.exists() && snap.data().orderId === order.id) await deleteDoc(ref);
+    }
+  } catch (err) {
+    console.error(err);
+    toast("Order reopened, but couldn't release its items.");
+  }
+}
+
 /* ---------- Actions: complete / delete ---------- */
+el.orders.addEventListener("change", (e) => {
+  const box = e.target.closest("input.pick");
+  if (!box) return;
+  const card = box.closest(".order");
+  picks.set(
+    card.dataset.id,
+    new Set([...card.querySelectorAll("input.pick:checked")].map((b) => b.dataset.key))
+  );
+});
+
 el.orders.addEventListener("click", async (e) => {
   const btn = e.target.closest("button[data-action]");
   if (!btn) return;
@@ -346,10 +475,30 @@ el.orders.addEventListener("click", async (e) => {
   btn.disabled = true;
   try {
     if (btn.dataset.action === "toggle") {
-      const next = order.status === "COMPLETED" ? "NOT COMPLETED" : "COMPLETED";
-      await updateDoc(doc(db, "orders", id), { status: next });
+      const next =
+        order.status === "COMPLETED" || order.status === "ITEM SOLD"
+          ? "NOT COMPLETED"
+          : "COMPLETED";
+      let keys = [];
+      if (next === "COMPLETED") {
+        keys = uniqueKeys(order).filter((k) => {
+          const it = orderItems(order).find((i) => itemKey(i) === k);
+          return isPicked(order, k, soldState(it, order));
+        });
+        if (!keys.length) {
+          toast("Tick at least one item the customer still wants.");
+          btn.disabled = false;
+          return;
+        }
+      }
+      await updateDoc(doc(db, "orders", id), { status: next, completedKeys: keys });
       order.status = next;
+      order.completedKeys = keys;
+      picks.delete(id); // ticks now come from the saved order
       toast(next === "COMPLETED" ? "Marked as completed" : "Marked as not completed");
+      if (next === "COMPLETED") await markItemsSold(order, keys);
+      else await releaseItems(order);
+      await loadSoldItems();
       render();
       // keep the order open after re-render
       el.orders.querySelector(`[data-id="${CSS.escape(id)}"]`)?.setAttribute("open", "");
