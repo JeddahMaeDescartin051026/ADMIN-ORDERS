@@ -247,3 +247,16 @@ input:focus, select:focus { border-color: var(--rose); }
 .pick-label { display: inline-flex; align-items: center; gap: .55rem; cursor: pointer; }
 .pick { width: 1.05rem; height: 1.05rem; accent-color: var(--rose); cursor: pointer; }
 .pick:disabled { cursor: not-allowed; }
+
+/* New, unopened order: pulses until it is clicked (the chime stops at the same time) */
+.order.is-new {
+  border-color: var(--rose-dark);
+  box-shadow: 0 0 0 3px var(--blush-deep);
+  animation: newOrderPulse 1.4s ease-in-out infinite;
+}
+@keyframes newOrderPulse {
+  50% { box-shadow: 0 0 0 7px var(--blush-deep); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .order.is-new { animation: none; }
+}

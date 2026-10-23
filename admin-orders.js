@@ -13,6 +13,7 @@ import {
   orderBy,
   limit,
   getDocs,
+  onSnapshot,
   doc,
   updateDoc,
   deleteDoc,
@@ -66,6 +67,8 @@ const el = {
 
 let allOrders = []; // orders returned by the last Firestore query
 let soldMap = new Map(); // soldItems document id -> { orderId, orderNo, name }
+const newIds = new Set(); // new orders that haven't been opened yet (they keep the chime ringing)
+let stopWatch = null; // unsubscribe function for the live order listener
 const picks = new Map(); // order id -> Set of ticked item keys (kept while you filter or search)
 
 /* ---------- Helpers ---------- */
@@ -136,6 +139,7 @@ function showView(name) {
 onAuthStateChanged(auth, (user) => {
   if (!user) {
     el.who.hidden = true;
+    stopWatching();
     showView("login");
     return;
   }
@@ -150,12 +154,14 @@ onAuthStateChanged(auth, (user) => {
     el.deniedText.textContent = !user.emailVerified
       ? "This email isn't verified yet. Verify it, then sign in again."
       : `Only ${ADMIN_EMAIL} can view orders. Sign out and use that account.`;
+    stopWatching();
     showView("denied");
     return;
   }
 
   showView("app");
   applyRange("7");
+  startWatching();
 });
 
 el.loginForm.addEventListener("submit", async (e) => {
@@ -352,7 +358,7 @@ function orderHTML(o) {
   const items = Array.isArray(o.items) ? o.items : [];
 
   return `
-  <details class="order" data-id="${esc(o.id)}">
+  <details class="order${newIds.has(o.id) ? " is-new" : ""}" data-id="${esc(o.id)}">
     <summary>
       <span class="o-name"><span class="o-no">${esc(orderLabel(o) || "No number")}</span>${esc(o.name || "No name")}</span>
       <span class="o-total">${peso(o.total)}</span>
@@ -406,6 +412,75 @@ function render() {
     toast(`Showing the latest ${MAX_ORDERS} orders. Narrow the dates to see others.`);
   }
 }
+
+
+/* ---------- Live new-order alerts (repeating chime) ---------- */
+// Listens for orders arriving while this page is open. The chime (order-chime.js)
+// repeats until each new order is clicked/opened.
+function startWatching() {
+  if (stopWatch) return;
+  let firstLoad = true;
+  stopWatch = onSnapshot(
+    query(collection(db, "orders"), orderBy("createdAt", "desc"), limit(25)),
+    (snap) => {
+      if (firstLoad) { firstLoad = false; return; } // orders that already existed don't ring
+      snap.docChanges().forEach((ch) => {
+        if (ch.type === "added") onNewOrder({ id: ch.doc.id, ...ch.doc.data() });
+        else if (ch.type === "removed") {
+          newIds.delete(ch.doc.id);
+          window.OrderChime?.stop(ch.doc.id);
+        }
+      });
+    },
+    (err) => console.error("Live orders listener stopped:", err)
+  );
+}
+
+function stopWatching() {
+  if (stopWatch) { stopWatch(); stopWatch = null; }
+  newIds.clear();
+  window.OrderChime?.stopAll();
+}
+
+function onNewOrder(order) {
+  if (allOrders.some((o) => o.id === order.id)) return;
+  newIds.add(order.id);
+  window.OrderChime?.start(order.id);
+  toast(`New order from ${order.name || "a customer"}`);
+
+  // Make sure the new order can actually be seen, so it can be opened to stop the chime
+  el.statusFilter.value = "";
+  el.searchBox.value = "";
+  el.itemBox.value = "";
+  const to = el.toDate.value;
+  const from = el.fromDate.value;
+  const today = manilaYMD();
+  if ((to && today > to) || (from && today < from)) {
+    applyRange("today"); // viewing another date range: jump to today's orders
+    return;
+  }
+  const openIds = [...el.orders.querySelectorAll(".order[open]")].map((d) => d.dataset.id);
+  allOrders.unshift(order);
+  render();
+  openIds.forEach((id) =>
+    el.orders.querySelector(`[data-id="${CSS.escape(id)}"]`)?.setAttribute("open", "")
+  );
+}
+
+// Opening a new order (clicking it) stops its chime
+el.orders.addEventListener(
+  "toggle",
+  (e) => {
+    const card = e.target;
+    if (!card.matches || !card.matches("details.order") || !card.open) return;
+    const id = card.dataset.id;
+    if (newIds.delete(id)) {
+      card.classList.remove("is-new");
+      window.OrderChime?.stop(id);
+    }
+  },
+  true
+);
 
 /* ---------- Items sold: one record per item, so other buyers see "SOLD" ---------- */
 const orderItems = (order) => (Array.isArray(order.items) ? order.items : []);
